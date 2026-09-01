@@ -1,4 +1,5 @@
 import base64
+import copy
 
 import anthropic
 
@@ -14,6 +15,31 @@ def _get_client() -> anthropic.Anthropic:
         _client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
     return _client
 
+
+
+# ============================================================
+# 分析プロファイル（用途ごとに「類型」と観察の指示を切り替える）
+#   hr      : 新卒採用SNS動画の分析（既定・従来動作）
+#   gourmet : 店舗集客／グルメ動画の分析（インフルエンサー選定・参考動画調査用）
+# ============================================================
+
+HR_CLASSIFICATION = [
+    "若手社員の1日密着",
+    "入社理由・就活ストーリー",
+    "キャリアパス可視化",
+    "内定者・同期の雰囲気",
+    "経営者・先輩の本音Q&A",
+    "理念・ブランドストーリー",
+]
+
+GOURMET_CLASSIFICATION = [
+    "商品アップ・シズル",
+    "価格・コスパ訴求",
+    "店舗・空間紹介",
+    "店主・スタッフの人物",
+    "企画・ネタ・検証",
+    "来店体験レポ",
+]
 
 CLASSIFICATION_OPTIONS = [
     "若手社員の1日密着",
@@ -97,8 +123,65 @@ SYSTEM = """あなたは新卒採用SNS動画（TikTok/Reels/Shorts）のクリ�
 """
 
 
-def analyze_video(transcript: str, frames: list[str], meta: dict) -> dict:
-    """文字起こし+キーフレーム画像を Claude に送って構造化分析。"""
+SYSTEM_GOURMET = """あなたは飲食店・店舗集客のSNS動画（Reels/TikTok）のクリエイティブ分析家です。
+渡された「文字起こし（Whisperによる音声認識）」と「動画のキーフレーム画像」を総合して日本語で分析してください。
+この分析は、**起用するインフルエンサーの選定**と**自店の動画づくりの参考**に使われます。
+
+【厳守】
+- video_title は 20 文字以内。店名・商品・切り口が分かる短いフレーズ。
+- classification は 6 択から 1 つ選ぶ：商品アップ・シズル / 価格・コスパ訴求 / 店舗・空間紹介 / 店主・スタッフの人物 / 企画・ネタ・検証 / 来店体験レポ。
+- tone は 6 択から 1 つ選ぶ：エンタメ・ネタ系 / バラエティ・キャラ系 / ドキュメント・リアル系 / 対話・トーク系 / エモ・シネマ系 / 情報整理・カード系。
+- hook は 2 項目、structure は 3 項目、adaptation は 3 項目。各 45 文字以内。
+- 体言止めまたは断定形。意味の重複を避け、1項目1論点。
+- 「美味しそう」等の感想語は禁止。**寄り/引き・テロップの位置と内容・価格の出し方・音の有無・尺配分・カット数**など、再現できる具体を書く。
+- **店舗情報の見せ方（店名・住所・営業時間・予約導線をどのカットで、どう出しているか）を必ず1項目は含める**。
+- adaptation は「自店の動画で真似る要素」として書く。
+- 画像に写るテロップ・料理の見せ方・店内の映し方・場面転換など視覚情報を必ず活用する。
+"""
+
+
+PROFILES = {
+    "hr": {
+        "label": "採用動画（HR）",
+        "classification": HR_CLASSIFICATION,
+        "system": SYSTEM,
+        "adaptation_desc": "転用ポイント（貴社版で真似る要素）。ちょうど3項目。各45文字以内。",
+        "doc_heading": "転用ポイント（貴社版で真似る要素）",
+    },
+    "gourmet": {
+        "label": "店舗集客・グルメ動画",
+        "classification": GOURMET_CLASSIFICATION,
+        "system": SYSTEM_GOURMET,
+        "adaptation_desc": "転用ポイント（自店の動画で真似る要素）。ちょうど3項目。各45文字以内。",
+        "doc_heading": "転用ポイント（自店で真似る要素）",
+    },
+}
+
+DEFAULT_MODE = "hr"
+
+
+def get_profile(mode: str | None = None) -> dict:
+    """モード名からプロファイルを取得。未知の値は既定(hr)にフォールバック。"""
+    if not mode:
+        mode = getattr(config, "ANALYSIS_MODE", DEFAULT_MODE) or DEFAULT_MODE
+    return PROFILES.get(mode, PROFILES[DEFAULT_MODE])
+
+
+def build_schema(mode: str | None = None) -> dict:
+    """プロファイルに応じて enum と説明文を差し替えたスキーマを返す。"""
+    prof = get_profile(mode)
+    schema = copy.deepcopy(SCHEMA)
+    schema["properties"]["classification"]["enum"] = prof["classification"]
+    schema["properties"]["adaptation"]["description"] = prof["adaptation_desc"]
+    return schema
+
+
+def analyze_video(transcript: str, frames: list[str], meta: dict, mode: str | None = None) -> dict:
+    """文字起こし+キーフレーム画像を Claude に送って構造化分析。
+
+    mode: "hr"（既定・採用動画）/ "gourmet"（店舗集客・グルメ動画）
+    """
+    prof = get_profile(mode)
     client = _get_client()
 
     # 画像コンテンツを構築
@@ -134,12 +217,12 @@ def analyze_video(transcript: str, frames: list[str], meta: dict) -> dict:
     resp = client.messages.create(
         model=config.ANTHROPIC_MODEL,
         max_tokens=4000,
-        system=SYSTEM,
+        system=prof["system"],
         messages=[{"role": "user", "content": content_blocks}],
         tools=[{
             "name": "output",
             "description": "分析結果を構造化して返す",
-            "input_schema": SCHEMA,
+            "input_schema": build_schema(mode),
         }],
         tool_choice={"type": "tool", "name": "output"},
     )
