@@ -51,3 +51,36 @@ def failed_entries() -> list[dict[str, Any]]:
 def clear():
     if os.path.exists(HISTORY_FILE):
         os.remove(HISTORY_FILE)
+
+
+def update_manual_metrics(url: str, view_count=None, save_count=None):
+    """Editsアプリ等で実測した再生数・保存数を既存エントリにマージする。
+
+    None は「未入力」として無視し、既存値を消さない。
+    実測再生数は `_view_count_manual` に保存し、自動取得値(`_view_count`)とは別に持つ。
+    """
+    entries = load()
+    changed = False
+    for e in entries:
+        if e.get("URL") != url:
+            continue
+        if view_count is not None:
+            e["_view_count_manual"] = int(view_count)
+            changed = True
+        if save_count is not None:
+            e["_save_count"] = int(save_count)
+            changed = True
+    if changed:
+        _write_all(entries)
+    return changed
+
+
+def effective_view_count(entry: dict) -> int | None:
+    """実測(Edits) > 自動取得(yt-dlp) の優先で再生数を返す。"""
+    v = entry.get("_view_count_manual")
+    if isinstance(v, (int, float)) and v:
+        return int(v)
+    v = entry.get("_view_count")
+    if isinstance(v, (int, float)) and v:
+        return int(v)
+    return None

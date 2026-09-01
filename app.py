@@ -156,24 +156,31 @@ def build_slide_replacements(
 def build_account_summary(entries: list[dict]):
     """履歴をアカウント単位に集計する。起用候補どうしの比較に使う。
 
-    再生数は `_view_count`（生の数値）から集計する。取得できなかった投稿は
-    平均の母数から除外し、「本数」には分析した全本数を出す。
+    再生数は Edits実測(_view_count_manual) > 自動取得(_view_count) の優先。
+    取得できなかった投稿は平均の母数から除外し、「本数」には分析した全本数を出す。
+    保存数はEditsアプリでの実測値のみ（自動取得は不可）。
     """
     rows = {}
     for e in entries:
         if e.get("ステータス") != "成功":
             continue
         acct = e.get("アカウント") or "（不明）"
-        r = rows.setdefault(acct, {"views": [], "likes": [], "ers": [], "durs": [], "n": 0})
+        r = rows.setdefault(acct, {"views": [], "likes": [], "ers": [], "durs": [], "saves": [], "srs": [], "n": 0})
         r["n"] += 1
-        v, l = e.get("_view_count"), e.get("_like_count")
+        v = history.effective_view_count(e)
+        l = e.get("_like_count")
         c, d = e.get("_comment_count"), e.get("_duration_sec")
-        if isinstance(v, (int, float)) and v:
+        sv = e.get("_save_count")
+        if v:
             r["views"].append(v)
             if isinstance(l, (int, float)):
                 r["ers"].append((l + (c or 0)) / v * 100)
+            if isinstance(sv, (int, float)):
+                r["srs"].append(sv / v * 100)
         if isinstance(l, (int, float)):
             r["likes"].append(l)
+        if isinstance(sv, (int, float)):
+            r["saves"].append(sv)
         if isinstance(d, (int, float)) and d:
             r["durs"].append(d)
 
@@ -198,6 +205,8 @@ def build_account_summary(entries: list[dict]):
             "平均再生数": fmt_count(round(avg(r["views"])) if r["views"] else None),
             "中央値再生数": fmt_count(round(median(r["views"])) if r["views"] else None),
             "最高再生数": fmt_count(max(r["views"]) if r["views"] else None),
+            "平均保存数": fmt_count(round(avg(r["saves"])) if r["saves"] else None),
+            "平均保存率": fmt_rate(round(avg(r["srs"]), 2) if r["srs"] else None),
             "平均いいね": fmt_count(round(avg(r["likes"])) if r["likes"] else None),
             "平均EG率": fmt_rate(round(avg(r["ers"]), 2) if r["ers"] else None),
             "平均尺": fmt_duration(round(avg(r["durs"])) if r["durs"] else None),
@@ -793,6 +802,8 @@ with tab_history:
                         "平均再生数": st.column_config.TextColumn("平均再生数", width="small"),
                         "中央値再生数": st.column_config.TextColumn("中央値", width="small"),
                         "最高再生数": st.column_config.TextColumn("最高", width="small"),
+                        "平均保存数": st.column_config.TextColumn("平均保存数", width="small"),
+                        "平均保存率": st.column_config.TextColumn("平均保存率", width="small"),
                         "平均いいね": st.column_config.TextColumn("平均いいね", width="small"),
                         "平均EG率": st.column_config.TextColumn("平均EG率", width="small"),
                         "平均尺": st.column_config.TextColumn("平均尺", width="small"),
@@ -804,6 +815,48 @@ with tab_history:
                     file_name=f"アカウント別サマリー_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv",
                 )
+
+            # ---- Edits実測値の入力（再生数・保存数の手動マージ） ----
+            ok_entries = [e for e in visible if e.get("ステータス") == "成功"]
+            if ok_entries:
+                st.subheader("📱 Edits実測値の入力")
+                st.caption(
+                    "Instagram公式の動画編集アプリ「Edits」では、他人のリールの再生数・保存数を確認できる場合があります"
+                    "（アカウントにより未表示のことあり）。スマホのEditsで確認した値を入力して保存すると、"
+                    "再生数は自動取得値より優先され、保存数・保存率がアカウント別サマリーに加わります。"
+                    "保存数は「あとで行く」の先行指標です。"
+                )
+                manual_rows = [{
+                    "タイトル": e.get("タイトル", ""),
+                    "アカウント": e.get("アカウント", ""),
+                    "再生数(実測)": e.get("_view_count_manual"),
+                    "保存数(実測)": e.get("_save_count"),
+                    "URL": e.get("URL", ""),
+                } for e in ok_entries]
+                edited = st.data_editor(
+                    pd.DataFrame(manual_rows),
+                    hide_index=True,
+                    use_container_width=True,
+                    disabled=["タイトル", "アカウント", "URL"],
+                    column_config={
+                        "再生数(実測)": st.column_config.NumberColumn("再生数(実測)", min_value=0, step=1),
+                        "保存数(実測)": st.column_config.NumberColumn("保存数(実測)", min_value=0, step=1),
+                        "URL": st.column_config.LinkColumn("URL", display_text="🔗"),
+                    },
+                    key="manual_metrics_editor",
+                )
+                if st.button("💾 実測値を保存してサマリーに反映"):
+                    n = 0
+                    for _, row in edited.iterrows():
+                        v = row.get("再生数(実測)")
+                        sv = row.get("保存数(実測)")
+                        v = int(v) if pd.notna(v) else None
+                        sv = int(sv) if pd.notna(sv) else None
+                        if v is not None or sv is not None:
+                            if history.update_manual_metrics(row["URL"], view_count=v, save_count=sv):
+                                n += 1
+                    st.success(f"{n}件の実測値を保存しました。")
+                    st.rerun()
 
             csv = df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
