@@ -25,6 +25,9 @@ TEMPLATE_SLIDES_ID = _get("TEMPLATE_SLIDES_ID")
 ANTHROPIC_MODEL = _get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 WHISPER_MODEL = _get("WHISPER_MODEL", "whisper-1")
 
+# 分析プロファイル: "hr"（採用動画・既定）/ "gourmet"（店舗集客・グルメ動画）
+ANALYSIS_MODE = _get("ANALYSIS_MODE", "hr")
+
 
 def _has_secret_service_account() -> bool:
     """Streamlit Secretsに google_service_account セクションがあるかチェック。"""

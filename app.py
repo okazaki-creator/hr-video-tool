@@ -47,7 +47,42 @@ def fmt_upload_date(yyyymmdd: str | None) -> str:
     return f"{yyyymmdd[0:4]}年{yyyymmdd[4:6]}月{yyyymmdd[6:8]}日"
 
 
-def format_analysis_doc(analysis: dict, meta: dict, url: str, duration_sec) -> str:
+def fmt_count(n) -> str:
+    """再生数などを 12,345 / 1.2万 表記に。取得できていなければ「取得不可」。"""
+    if n is None or n == "":
+        return "取得不可"
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "取得不可"
+    if n >= 10000:
+        return f"{n / 10000:.1f}万".replace(".0万", "万")
+    return f"{n:,}"
+
+
+def fmt_rate(r) -> str:
+    return "取得不可" if r is None else f"{r}%"
+
+
+def format_metrics_block(meta: dict) -> list[str]:
+    """分析Docsに差し込むパフォーマンス指標のブロック。"""
+    er = downloader.engagement_rate(meta)
+    lines = [
+        "",
+        "## パフォーマンス指標",
+        f"再生数: {fmt_count(meta.get('view_count'))}",
+        f"いいね: {fmt_count(meta.get('like_count'))}",
+        f"コメント: {fmt_count(meta.get('comment_count'))}",
+        f"エンゲージメント率: {fmt_rate(er)}　※(いいね+コメント)÷再生数",
+    ]
+    if meta.get("follower_count"):
+        lines.append(f"アカウントのフォロワー: {fmt_count(meta.get('follower_count'))}")
+    if meta.get("view_count") is None:
+        lines.append("※ このプラットフォームでは再生数が公開APIから取得できませんでした。")
+    return lines
+
+
+def format_analysis_doc(analysis: dict, meta: dict, url: str, duration_sec, mode: str | None = None) -> str:
     lines = [
         "# 参考動画分析",
         "",
@@ -60,6 +95,9 @@ def format_analysis_doc(analysis: dict, meta: dict, url: str, duration_sec) -> s
         f"アカウント名: {meta.get('uploader', '')} / @{meta.get('uploader_id', '')}",
         f"尺: {fmt_duration(duration_sec)}",
         f"投稿日: {fmt_upload_date(meta.get('upload_date'))}",
+    ]
+    lines += format_metrics_block(meta)
+    lines += [
         "",
         "## フック（冒頭2秒で何が起きるか）",
     ]
@@ -68,7 +106,7 @@ def format_analysis_doc(analysis: dict, meta: dict, url: str, duration_sec) -> s
     lines += ["", "## 構成メモ（本編の展開・編集の特徴）"]
     for i, s in enumerate(analysis.get("structure", []), 1):
         lines.append(f"{i}. {s}")
-    lines += ["", "## 転用ポイント（貴社版で真似る要素）"]
+    lines += ["", f"## {analyzer.get_profile(mode).get('doc_heading', '転用ポイント')}"]
     for i, s in enumerate(analysis.get("adaptation", []), 1):
         lines.append(f"{i}. {s}")
     return "\n".join(lines)
@@ -97,6 +135,10 @@ def build_slide_replacements(
         "アカウント名": f"{meta.get('uploader', '')} / @{meta.get('uploader_id', '')}",
         "尺": fmt_duration(duration_sec),
         "投稿日": fmt_upload_date(meta.get("upload_date")),
+        "再生数": fmt_count(meta.get("view_count")),
+        "いいね": fmt_count(meta.get("like_count")),
+        "コメント": fmt_count(meta.get("comment_count")),
+        "エンゲージメント率": fmt_rate(downloader.engagement_rate(meta)),
         "フック1": hook[0],
         "フック2": hook[1],
         "構成メモ1": structure[0],
@@ -109,6 +151,60 @@ def build_slide_replacements(
         "分析URL": analysis_doc_url,
         "フォルダURL": folder_url,
     }
+
+
+def build_account_summary(entries: list[dict]):
+    """履歴をアカウント単位に集計する。起用候補どうしの比較に使う。
+
+    再生数は `_view_count`（生の数値）から集計する。取得できなかった投稿は
+    平均の母数から除外し、「本数」には分析した全本数を出す。
+    """
+    rows = {}
+    for e in entries:
+        if e.get("ステータス") != "成功":
+            continue
+        acct = e.get("アカウント") or "（不明）"
+        r = rows.setdefault(acct, {"views": [], "likes": [], "ers": [], "durs": [], "n": 0})
+        r["n"] += 1
+        v, l = e.get("_view_count"), e.get("_like_count")
+        c, d = e.get("_comment_count"), e.get("_duration_sec")
+        if isinstance(v, (int, float)) and v:
+            r["views"].append(v)
+            if isinstance(l, (int, float)):
+                r["ers"].append((l + (c or 0)) / v * 100)
+        if isinstance(l, (int, float)):
+            r["likes"].append(l)
+        if isinstance(d, (int, float)) and d:
+            r["durs"].append(d)
+
+    if not rows:
+        return None
+
+    def avg(xs):
+        return sum(xs) / len(xs) if xs else None
+
+    def median(xs):
+        if not xs:
+            return None
+        s = sorted(xs)
+        m = len(s) // 2
+        return s[m] if len(s) % 2 else (s[m - 1] + s[m]) / 2
+
+    out = []
+    for acct, r in rows.items():
+        out.append({
+            "アカウント": acct,
+            "本数": r["n"],
+            "平均再生数": fmt_count(round(avg(r["views"])) if r["views"] else None),
+            "中央値再生数": fmt_count(round(median(r["views"])) if r["views"] else None),
+            "最高再生数": fmt_count(max(r["views"]) if r["views"] else None),
+            "平均いいね": fmt_count(round(avg(r["likes"])) if r["likes"] else None),
+            "平均EG率": fmt_rate(round(avg(r["ers"]), 2) if r["ers"] else None),
+            "平均尺": fmt_duration(round(avg(r["durs"])) if r["durs"] else None),
+            "_sort": avg(r["views"]) or -1,
+        })
+    df = pd.DataFrame(out).sort_values("_sort", ascending=False).drop(columns=["_sort"])
+    return df.reset_index(drop=True)
 
 
 # --- タブ ---
@@ -250,7 +346,7 @@ def process_single_url(
             meta_for_ai = dict(meta)
             if not meta_for_ai.get("duration"):
                 meta_for_ai["duration"] = duration_sec
-            analysis = analyzer.analyze_video(transcript, key_frames, meta_for_ai)
+            analysis = analyzer.analyze_video(transcript, key_frames, meta_for_ai, mode=st.session_state.get("analysis_mode"))
             video_title = sanitize(analysis.get("video_title") or "無題動画", max_len=40)
             state["_analysis"] = analysis
             log.write(f"✅ 分析完了：**{video_title}**")
@@ -265,6 +361,14 @@ def process_single_url(
             "アカウント": f"{meta.get('uploader', '')} / @{meta.get('uploader_id', '')}",
             "尺": fmt_duration(duration_sec),
             "投稿日": fmt_upload_date(meta.get("upload_date")),
+            "再生数": fmt_count(meta.get("view_count")),
+            "いいね": fmt_count(meta.get("like_count")),
+            "コメント": fmt_count(meta.get("comment_count")),
+            "EG率": fmt_rate(downloader.engagement_rate(meta)),
+            "_view_count": meta.get("view_count"),
+            "_like_count": meta.get("like_count"),
+            "_comment_count": meta.get("comment_count"),
+            "_duration_sec": duration_sec,
             "URL": url,
         })
     except Exception as e:
@@ -349,7 +453,7 @@ def process_single_url(
         if analysis_doc_id:
             log.markdown(f"♻️ 分析Docsは既に生成済み：[開く]({drive.file_url(analysis_doc_id, 'document')})")
         else:
-            analysis_text = format_analysis_doc(analysis, meta, url, duration_sec)
+            analysis_text = format_analysis_doc(analysis, meta, url, duration_sec, mode=st.session_state.get("analysis_mode"))
             analysis_doc_id = docs.create_doc_with_text(
                 f"分析_{video_title}", analysis_text, folder_id
             )
@@ -423,6 +527,14 @@ def process_single_url(
         "アカウント": f"{meta.get('uploader', '')} / @{meta.get('uploader_id', '')}",
         "尺": fmt_duration(duration_sec),
         "投稿日": fmt_upload_date(meta.get("upload_date")),
+        "再生数": fmt_count(meta.get("view_count")),
+        "いいね": fmt_count(meta.get("like_count")),
+        "コメント": fmt_count(meta.get("comment_count")),
+        "EG率": fmt_rate(downloader.engagement_rate(meta)),
+        "_view_count": meta.get("view_count"),
+        "_like_count": meta.get("like_count"),
+        "_comment_count": meta.get("comment_count"),
+        "_duration_sec": duration_sec,
         "URL": url,
     })
     return _finalize_success()
@@ -527,6 +639,22 @@ def execute_url_batch(urls: list[str]):
 
 with tab_run:
     st.subheader("動画分析を実行")
+    mode_labels = {k: v["label"] for k, v in analyzer.PROFILES.items()}
+    mode_keys = list(mode_labels.keys())
+    default_idx = mode_keys.index(config.ANALYSIS_MODE) if config.ANALYSIS_MODE in mode_keys else 0
+    chosen = st.selectbox(
+        "分析モード",
+        mode_keys,
+        index=default_idx,
+        format_func=lambda k: mode_labels[k],
+        help="動画を「何の参考として」分析するかを切り替えます。類型の選択肢と観察の指示が変わります。",
+        key="analysis_mode",
+    )
+    st.caption(
+        {"hr": "採用動画として分析します（従来動作）。",
+         "gourmet": "店舗集客・グルメ動画として分析します。店舗情報の見せ方まで観察します。"}.get(chosen, "")
+    )
+
 
     default_urls = st.session_state.pop("prefill_urls", "")
     raw_urls = st.text_area(
@@ -641,8 +769,41 @@ with tab_history:
                     "ステータス": st.column_config.TextColumn("状態", width="small"),
                     "失敗ステップ": st.column_config.TextColumn("失敗箇所", width="small"),
                     "エラー": st.column_config.TextColumn("エラー", width="medium"),
+                    "再生数": st.column_config.TextColumn("再生数", width="small"),
+                    "いいね": st.column_config.TextColumn("いいね", width="small"),
+                    "コメント": st.column_config.TextColumn("コメント", width="small"),
+                    "EG率": st.column_config.TextColumn("EG率", width="small"),
                 },
             )
+
+            # ---- アカウント別サマリー（起用候補の比較用） ----
+            summary = build_account_summary(visible)
+            if summary is not None and not summary.empty:
+                st.subheader("👤 アカウント別サマリー")
+                st.caption(
+                    "起用候補を比較するための集計です。再生数が取得できた投稿のみを平均に含めています。"
+                )
+                st.dataframe(
+                    summary,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "アカウント": st.column_config.TextColumn("アカウント", width="medium"),
+                        "本数": st.column_config.NumberColumn("分析本数", width="small"),
+                        "平均再生数": st.column_config.TextColumn("平均再生数", width="small"),
+                        "中央値再生数": st.column_config.TextColumn("中央値", width="small"),
+                        "最高再生数": st.column_config.TextColumn("最高", width="small"),
+                        "平均いいね": st.column_config.TextColumn("平均いいね", width="small"),
+                        "平均EG率": st.column_config.TextColumn("平均EG率", width="small"),
+                        "平均尺": st.column_config.TextColumn("平均尺", width="small"),
+                    },
+                )
+                st.download_button(
+                    label="📥 アカウント別サマリーをCSVで保存",
+                    data=summary.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"アカウント別サマリー_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                )
 
             csv = df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(

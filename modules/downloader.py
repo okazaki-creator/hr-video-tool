@@ -271,8 +271,28 @@ def download_video(url: str, output_dir: str) -> tuple[str, dict]:
         "upload_date": info.get("upload_date"),  # YYYYMMDD
         "webpage_url": info.get("webpage_url") or url,
         "extractor": info.get("extractor_key") or info.get("extractor") or "",
+        # --- パフォーマンス指標（取れないプラットフォームでは None のまま） ---
+        # IG Reels は view_count が出ないことがある。その場合 play_count を代替に使う。
+        "view_count": info.get("view_count") if info.get("view_count") is not None else info.get("play_count"),
+        "like_count": info.get("like_count"),
+        "comment_count": info.get("comment_count"),
+        "repost_count": info.get("repost_count"),
+        "follower_count": info.get("channel_follower_count"),
     }
     return filepath, meta
+
+
+def engagement_rate(meta: dict):
+    """(いいね + コメント) / 再生数 × 100。再生数が取れない場合は None。"""
+    views = meta.get("view_count")
+    if not views:
+        return None
+    likes = meta.get("like_count") or 0
+    comments = meta.get("comment_count") or 0
+    try:
+        return round((likes + comments) / views * 100, 2)
+    except (TypeError, ZeroDivisionError):
+        return None
 
 
 def platform_label(meta: dict) -> str:
